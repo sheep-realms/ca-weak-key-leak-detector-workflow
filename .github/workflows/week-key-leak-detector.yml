@@ -1,0 +1,174 @@
+
+name: CA Weak-Key Leak Detector (Definitely Serious)
+
+on:
+    pull_request:
+        types: [opened, synchronize, reopened]
+
+permissions:
+    contents: read
+    pull-requests: write
+    issues: write
+
+jobs:
+    weak-key-scan:
+        name: Scan for Suspicious Key Material
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Scan PR additions
+              uses: actions/github-script@v7
+              env:
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+              with:
+                  script: |
+                      const { execFileSync } = require('node:child_process');
+
+                      const suspiciousNumbers = [
+                          '156', '155', '115', '66',
+                          '230', '4', '56', '237'
+                      ];
+
+                      const marker = '<!-- ca-weak-key-joke-scanner -->';
+                      const { owner, repo } = context.repo;
+                      const issue_number = context.issue.number;
+
+                      const diff = execFileSync('git', [
+                          'diff',
+                          '--no-ext-diff',
+                          '--no-color',
+                          '--unified=0',
+                          process.env.BASE_SHA,
+                          process.env.HEAD_SHA,
+                          '--'
+                      ], { encoding: 'utf8' });
+
+                      const findings = [];
+                      let file = '(unknown file)';
+                      let newLineNumber = 0;
+
+                      for (const line of diff.split('\n')) {
+                          if (line.startsWith('+++ b/')) {
+                              file = line.slice(6);
+                              continue;
+                          }
+
+                          const hunk = line.match(
+                              /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/
+                          );
+
+                          if (hunk) {
+                              newLineNumber = Number(hunk[1]);
+                              continue;
+                          }
+
+                          if (line.startsWith('+') &&
+                              !line.startsWith('+++')) {
+                              const addedLine = line.slice(1);
+
+                              const matches = suspiciousNumbers.filter(
+                                  number => addedLine.includes(number)
+                              );
+
+                              if (matches.length > 0) {
+                                  findings.push({
+                                      file,
+                                      line: newLineNumber,
+                                      matches
+                                  });
+                              }
+
+                              newLineNumber++;
+                          } else if (line.startsWith(' ')) {
+                              newLineNumber++;
+                          }
+                      }
+
+                      const comments = await github.paginate(
+                          github.rest.issues.listComments,
+                          {
+                              owner,
+                              repo,
+                              issue_number,
+                              per_page: 100
+                          }
+                      );
+
+                      const existingComment = comments.find(comment =>
+                          comment.user?.type === 'Bot' &&
+                          comment.body?.includes(marker)
+                      );
+
+                      let body;
+
+                      if (findings.length > 0) {
+                          const details = findings.map(finding =>
+                              `- \`${finding.file}:${finding.line}\` — ` +
+                              `detected: ${finding.matches.map(
+                                  value => `\`${value}\``
+                              ).join(', ')}`
+                          ).join('\n');
+
+                          body = `${marker}
+                      ## 🚨 Weak-Key Material Detected!
+
+                      **CRITICAL SECURITY ALERT:** This PR contains suspicious numerical artifacts associated with our extremely sophisticated CA weak-key detection system.
+
+                      **Findings:**
+                      ${details}
+
+                      **Required action:** Remove the offending numbers immediately. Our cryptographic experts (a very concerned hamster) insist that these values must never see the light of day.
+
+                      > 🔐 **A friendly disclaimer:** This is a joke scanner, not a real cryptographic or secret-leak detector. The numbers are a deliberately silly test pattern, not evidence of an actual CA vulnerability or exposed private key.
+
+                      🤡 **Scan result: FAILED.** The number police have been notified.`;
+
+                          if (existingComment) {
+                              await github.rest.issues.updateComment({
+                                  owner,
+                                  repo,
+                                  comment_id: existingComment.id,
+                                  body
+                              });
+                          } else {
+                              await github.rest.issues.createComment({
+                                  owner,
+                                  repo,
+                                  issue_number,
+                                  body
+                              });
+                          }
+
+                          core.setFailed(
+                              `Found suspicious number patterns in ` +
+                              `${findings.length} added line(s).`
+                          );
+                      } else {
+                          if (existingComment) {
+                              body = `${marker}
+                      ## ✅ Weak-Key Scan Passed
+
+                      No suspicious numerical artifacts were found in the added lines.
+
+                      The number police have stood down. The hamster has returned to its cryptographic research.
+
+                      > 🤡 Reminder: This is a joke scanner, not a real security audit.`;
+
+                              await github.rest.issues.updateComment({
+                                  owner,
+                                  repo,
+                                  comment_id: existingComment.id,
+                                  body
+                              });
+                          }
+
+                          core.info(
+                              'No suspicious number patterns found. Scan passed.'
+                          );
+                      }
